@@ -38,8 +38,10 @@ Outputs:
 """
 from __future__ import annotations
 
+import argparse
 import heapq
 import math
+import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
@@ -312,7 +314,7 @@ def build_demo_network() -> Tuple[Network, Neuron, Neuron, Neuron, Synapse, Syna
     return net, n0, n1, n2, s0, s1
 
 
-def run_demo() -> None:
+def run_demo(plot: bool = True) -> None:
     net, n0, n1, n2, s0, s1 = build_demo_network()
 
     sim_end = 0.2  # 200 ms
@@ -339,24 +341,132 @@ def run_demo() -> None:
     print(f"Synapse 1 (Input1→Output): {initial_weights[1]:.3f} mV → {s1.weight:.3f} mV")
 
     # Plot membrane potential of Output neuron
-    plt.figure(figsize=(8, 4))
-    times_ms = [t * 1e3 for t in n2.trace_times]
-    plt.plot(times_ms, n2.trace_vm, label="Output Vm (mV)")
+    if plot:
+        plt.figure(figsize=(8, 4))
+        times_ms = [t * 1e3 for t in n2.trace_times]
+        plt.plot(times_ms, n2.trace_vm, label="Output Vm (mV)")
 
-    # Mark spike times
-    output_spike_times = [t for (t, nid, _) in net.spike_log if nid == n2.id]
-    for t in output_spike_times:
-        plt.axvline(t * 1e3, color="r", linestyle="--", alpha=0.5)
+        # Mark spike times
+        output_spike_times = [t for (t, nid, _) in net.spike_log if nid == n2.id]
+        for t in output_spike_times:
+            plt.axvline(t * 1e3, color="r", linestyle="--", alpha=0.5)
 
-    plt.title("Output Neuron Membrane Potential (Event-Driven LIF)")
-    plt.xlabel("Time (ms)")
-    plt.ylabel("Vm (mV)")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("snn_output.png", dpi=150)
-    print("\nSaved membrane potential plot to 'snn_output.png'.")
+        plt.title("Output Neuron Membrane Potential (Event-Driven LIF)")
+        plt.xlabel("Time (ms)")
+        plt.ylabel("Vm (mV)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("snn_output.png", dpi=150)
+        print("\nSaved membrane potential plot to 'snn_output.png'.")
+
+
+# ------------------------- Deterministic self-tests -------------------------
+
+def _assert_close(actual: float, expected: float, tol: float = 1e-6) -> None:
+    if abs(actual - expected) > tol:
+        raise AssertionError(f"Not close: actual={actual}, expected={expected}, tol={tol}")
+
+
+def test_lif_decay() -> None:
+    neuron = Neuron(0, "TestNeuron", v_rest=-65.0, v_reset=-65.0, v_th=-50.0, tau_m=20e-3)
+    neuron.v_m = -50.0
+    neuron.last_update_time = 0.0
+    t1 = 0.010  # 10 ms
+    neuron.decay_to(t1)
+    expected_vm = -65.0 + ( -50.0 - (-65.0) ) * math.exp(-(t1 - 0.0) / 0.020)
+    _assert_close(neuron.v_m, expected_vm, tol=1e-6)
+
+
+def test_threshold_and_refractory() -> None:
+    net = Network()
+    n = Neuron(0, "N", v_rest=-65.0, v_reset=-65.0, v_th=-50.0, tau_m=20e-3, refractory_period=5e-3)
+    net.add_neuron(n)
+
+    # At t=0, deliver a suprathreshold delta-V
+    n.v_m = -65.0
+    n.last_update_time = 0.0
+    n.receive_delta_v(0.0, 16.0, net)  # -65 + 16 = -49 >= -50 => spike
+    if not net.spike_log or net.spike_log[-1][1] != n.id:
+        raise AssertionError("Expected a spike at t=0.0")
+    _assert_close(n.v_m, n.v_reset, tol=1e-12)
+
+    # During refractory, inputs should have no effect
+    n.receive_delta_v(0.001, 100.0, net)  # 1 ms later, still refractory (5 ms)
+    if len(net.spike_log) != 1:
+        raise AssertionError("Unexpected spike during refractory period")
+    _assert_close(n.v_m, n.v_reset, tol=1e-12)
+
+
+def test_synaptic_delay_causes_post_spike() -> None:
+    net = Network()
+    pre = Neuron(0, "pre")
+    post = Neuron(1, "post")
+    net.add_neuron(pre)
+    net.add_neuron(post)
+    syn = Synapse(id=0, pre=pre, post=post, weight=20.0, delay=5e-3)
+    net.add_synapse(syn)
+
+    net.schedule_external_spike(pre.id, 0.100)
+    net.run(0.200)
+
+    # Expect pre spike at 0.100 and post spike at 0.105 due to strong weight
+    times = [t for (t, nid, _) in net.spike_log if nid in (pre.id, post.id)]
+    if not any(abs(t - 0.100) < 1e-9 for t in times):
+        raise AssertionError("Missing pre spike at 0.100 s")
+    if not any(abs(t - 0.105) < 1e-9 for t in times):
+        raise AssertionError("Missing post spike at 0.105 s due to delay")
+
+
+def test_stdp_pair_rule() -> None:
+    # Use direct synapse calls to test LTP/LTD magnitudes
+    pre = Neuron(0, "pre")
+    post = Neuron(1, "post")
+    s_ltp = Synapse(id=0, pre=pre, post=post, weight=10.0, delay=0.0, A_plus=0.8, A_minus=0.8, tau_plus=20e-3, tau_minus=20e-3)
+    t_pre = 0.100
+    t_post = 0.105
+    s_ltp.on_pre_spike(t_pre)
+    s_ltp.on_post_spike(t_post)
+    expected_delta = 0.8 * math.exp(-(t_post - t_pre) / 0.020)
+    _assert_close(s_ltp.weight - 10.0, expected_delta, tol=1e-6)
+
+    s_ltd = Synapse(id=1, pre=pre, post=post, weight=10.0, delay=0.0, A_plus=0.8, A_minus=0.8, tau_plus=20e-3, tau_minus=20e-3)
+    # Post before pre => depression (Δt = 1 ms)
+    s_ltd.on_post_spike(0.105)
+    s_ltd.on_pre_spike(0.106)
+    expected_delta = -0.8 * math.exp(-(0.106 - 0.105) / 0.020)
+    _assert_close(s_ltd.weight - 10.0, expected_delta, tol=1e-6)
+
+
+def run_self_tests(verbose: bool = True) -> None:
+    tests = [
+        ("LIF decay", test_lif_decay),
+        ("Threshold & refractory", test_threshold_and_refractory),
+        ("Synaptic delay", test_synaptic_delay_causes_post_spike),
+        ("STDP pair rule", test_stdp_pair_rule),
+    ]
+    for name, fn in tests:
+        fn()
+        if verbose:
+            print(f"[PASS] {name}")
+    if verbose:
+        print("All self-tests passed.")
 
 
 if __name__ == "__main__":
-    run_demo()
+    parser = argparse.ArgumentParser(description="Event-driven LIF SNN with STDP (demo + self-tests)")
+    parser.add_argument("--test-only", action="store_true", help="Run deterministic self-tests only and exit")
+    parser.add_argument("--skip-tests", action="store_true", help="Skip self-tests and run demo only")
+    parser.add_argument("--no-plot", action="store_true", help="Skip plot generation in the demo run")
+    args = parser.parse_args()
+
+    if not args.skip_tests:
+        try:
+            run_self_tests(verbose=True)
+        except AssertionError as e:
+            print(f"[FAIL] Self-tests failed: {e}")
+            raise SystemExit(1)
+        if args.test_only:
+            raise SystemExit(0)
+
+    run_demo(plot=(not args.no_plot))
