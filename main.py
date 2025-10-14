@@ -19,6 +19,8 @@ import math
 import random
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
+import argparse
+import sys
 
 
 # ----------------------------- Utility Types ----------------------------- #
@@ -489,5 +491,220 @@ def run_demo() -> None:
     print(f"\nSaved membrane potential plot to: {plot_file}")
 
 
+def run_scenario(
+    n0_spike_time: float = 100.0,
+    n1_spike_time: float = 115.0,
+    s0_weight: float = 1.10,
+    s1_weight: float = 0.60,
+    delay: float = 5.0,
+    w_min: float = 0.0,
+    w_max: float = 2.0,
+    plot_file: Optional[str] = "snn_results.png",
+    enable_acceptance: bool = True,
+) -> int:
+    """Run a parameterized 2->1 scenario; return 0 on acceptance pass else 1.
+
+    This mirrors run_demo() but allows CLI-provided values and prints
+    acceptance checks that define correctness for manual testing.
+    """
+    # Validate inputs
+    if not (0.0 <= n0_spike_time <= 5000.0):
+        print(f"[ERROR] n0_spike_time out of range [0,5000]: {n0_spike_time}", file=sys.stderr)
+        return 2
+    if not (0.0 <= n1_spike_time <= 5000.0):
+        print(f"[ERROR] n1_spike_time out of range [0,5000]: {n1_spike_time}", file=sys.stderr)
+        return 2
+    if not (0.0 < delay <= 1000.0):
+        print(f"[ERROR] delay out of range (0,1000]: {delay}", file=sys.stderr)
+        return 2
+    if not (w_min < w_max):
+        print(f"[ERROR] w_min must be < w_max (got {w_min} >= {w_max})", file=sys.stderr)
+        return 2
+    if not (w_min <= s0_weight <= w_max):
+        print(f"[ERROR] s0_weight {s0_weight} not in [{w_min},{w_max}]", file=sys.stderr)
+        return 2
+    if not (w_min <= s1_weight <= w_max):
+        print(f"[ERROR] s1_weight {s1_weight} not in [{w_min},{w_max}]", file=sys.stderr)
+        return 2
+
+    net = Network()
+
+    # Create neurons
+    n0 = net.add_neuron("N0", is_input_generator=True)
+    n1 = net.add_neuron("N1", is_input_generator=True)
+    n_out = net.add_neuron(
+        "N_out",
+        v_rest=0.0,
+        v_reset=0.0,
+        v_threshold=1.0,
+        tau_m=20.0,
+        refractory_period=5.0,
+        is_input_generator=False,
+    )
+
+    net.track_neuron_vm(n_out)
+
+    # Connect synapses with same delay, parameterized weights
+    s0 = net.connect(
+        n0, n_out, weight=float(s0_weight), delay=float(delay), label="S0",
+        tau_plus=20.0, tau_minus=20.0, a_plus=0.05, a_minus=0.05,
+        w_min=float(w_min), w_max=float(w_max),
+    )
+    s1 = net.connect(
+        n1, n_out, weight=float(s1_weight), delay=float(delay), label="S1",
+        tau_plus=20.0, tau_minus=20.0, a_plus=0.05, a_minus=0.05,
+        w_min=float(w_min), w_max=float(w_max),
+    )
+
+    # Print initial weights
+    print("Initial Weights:")
+    print(f"  S0 (N0->N_out): {net.synapses_by_id[s0].weight:.6f}")
+    print(f"  S1 (N1->N_out): {net.synapses_by_id[s1].weight:.6f}")
+
+    # Schedule spikes
+    net.schedule_input_spike(n0, float(n0_spike_time))
+    net.schedule_input_spike(n1, float(n1_spike_time))
+
+    # Run simulation
+    net.run()
+
+    # Print spike log
+    print("\nEvent-Driven Spike Log (time ms, neuron):")
+    for t, name in sorted(net.spike_log, key=lambda x: x[0]):
+        print(f"  {t:7.3f}  {name}")
+
+    # Print final weights
+    print("\nFinal Weights:")
+    final_w0 = net.synapses_by_id[s0].weight
+    final_w1 = net.synapses_by_id[s1].weight
+    print(f"  S0 (N0->N_out): {final_w0:.6f}")
+    print(f"  S1 (N1->N_out): {final_w1:.6f}")
+
+    # Plot if requested
+    if plot_file:
+        net.render_tracked_vm_plot(plot_file)
+        print(f"\nSaved membrane potential plot to: {plot_file}")
+
+    if not enable_acceptance:
+        return 0
+
+    # --------------------- Acceptance criteria and report --------------------- #
+    print("\nAcceptance checks:")
+    tol = 1e-10
+    t_post_first: Optional[float] = None
+    for t, name in sorted(net.spike_log, key=lambda x: x[0]):
+        if name == "N_out":
+            t_post_first = t
+            break
+
+    # 1) Output neuron spiked at least once if s0_weight >= threshold
+    expected_spike_due_to_s0 = s0_weight >= 1.0
+    has_output_spike = t_post_first is not None
+    if expected_spike_due_to_s0 and has_output_spike:
+        print("  [PASS] Output neuron spiked as expected.")
+        pass_output_spike = True
+    elif expected_spike_due_to_s0 and not has_output_spike:
+        print("  [FAIL] Output neuron did not spike despite S0 >= threshold.")
+        pass_output_spike = False
+    else:
+        # No spike expected if s0 < threshold; still acceptable
+        print("  [INFO] Output spiking not required (S0 below threshold).")
+        pass_output_spike = True
+
+    # 2) S0 direction: if pre arrival <= first post, expect LTP (increase)
+    init_w0 = s0_weight
+    init_w1 = s1_weight
+    t0_arrival = n0_spike_time + delay
+    t1_arrival = n1_spike_time + delay
+    s0_expected_up = has_output_spike and (t0_arrival <= (t_post_first or float("inf")))
+    # Equality (arrival at the same time as post) yields LTP in this event order
+    s1_expected_up = has_output_spike and (t1_arrival <= (t_post_first or float("inf")))
+    s1_expected_down = has_output_spike and (t1_arrival > (t_post_first or float("inf")))
+
+    dw0 = final_w0 - init_w0
+    dw1 = final_w1 - init_w1
+
+    if s0_expected_up and ((dw0 > tol) or (final_w0 >= (w_max - tol))):
+        print(f"  [PASS] S0 LTP occurred or saturated at upper bound (Δw={dw0:+.6f}).")
+        pass_s0 = True
+    elif s0_expected_up and not ((dw0 > tol) or (final_w0 >= (w_max - tol))):
+        print(f"  [FAIL] S0 did not potentiate as expected (Δw={dw0:+.6f}).")
+        pass_s0 = False
+    else:
+        print("  [INFO] No specific S0 change required for this configuration.")
+        pass_s0 = True
+
+    if s1_expected_up and ((dw1 > tol) or (final_w1 >= (w_max - tol))):
+        print(f"  [PASS] S1 LTP occurred or saturated at upper bound (Δw={dw1:+.6f}).")
+        pass_s1_dir = True
+    elif s1_expected_down and ((dw1 < -tol) or (final_w1 <= (w_min + tol))):
+        print(f"  [PASS] S1 LTD occurred or saturated at lower bound (Δw={dw1:+.6f}).")
+        pass_s1_dir = True
+    elif (s1_expected_up or s1_expected_down):
+        print(f"  [FAIL] S1 change direction unexpected (Δw={dw1:+.6f}).")
+        pass_s1_dir = False
+    else:
+        print("  [INFO] No specific S1 change required for this configuration.")
+        pass_s1_dir = True
+
+    # 3) Hard bounds respected
+    bounds_ok = (w_min - tol) <= final_w0 <= (w_max + tol) and (w_min - tol) <= final_w1 <= (w_max + tol)
+    if bounds_ok:
+        print("  [PASS] Weights respect hard bounds [w_min, w_max].")
+    else:
+        print("  [FAIL] Weights violated hard bounds [w_min, w_max].")
+
+    overall_pass = pass_output_spike and pass_s0 and pass_s1_dir and bounds_ok
+    if overall_pass:
+        print("\nRESULT: ALL ACCEPTANCE CHECKS PASSED.")
+        return 0
+    print("\nRESULT: ACCEPTANCE CHECKS FAILED.")
+    return 1
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run an event-driven SNN demo with parameter overrides and acceptance checks."
+    )
+    parser.add_argument("--n0-spike-time", type=float, default=100.0, help="Spike time for N0 (ms), default 100.0")
+    parser.add_argument("--n1-spike-time", type=float, default=115.0, help="Spike time for N1 (ms), default 115.0")
+    parser.add_argument("--s0-weight", type=float, default=1.10, help="Initial weight for S0, default 1.10")
+    parser.add_argument("--s1-weight", type=float, default=0.60, help="Initial weight for S1, default 0.60")
+    parser.add_argument("--delay", type=float, default=5.0, help="Synaptic delay for S0/S1 (ms), default 5.0")
+    parser.add_argument("--w-min", type=float, default=0.0, help="Hard minimum synaptic weight, default 0.0")
+    parser.add_argument("--w-max", type=float, default=2.0, help="Hard maximum synaptic weight, default 2.0")
+    parser.add_argument("--value", type=float, default=None, help="Single uploaded value to apply (see --value-kind)")
+    parser.add_argument("--value-kind", type=str, choices=["n1_spike_time", "s1_weight"], default="n1_spike_time",
+                        help="Interpretation of --value; default n1_spike_time")
+    parser.add_argument("--no-plot", action="store_true", help="Skip creating the membrane plot")
+    parser.add_argument("--plot-file", type=str, default="snn_results.png", help="Plot output path")
+    parser.add_argument("--no-acceptance", action="store_true", help="Skip acceptance checks")
+    return parser.parse_args(argv)
+
+
+def main_cli(argv: Optional[List[str]] = None) -> int:
+    args = _parse_args(argv)
+    # If a single uploaded value is provided, apply it
+    if args.value is not None:
+        if args.value_kind == "n1_spike_time":
+            args.n1_spike_time = float(args.value)
+        elif args.value_kind == "s1_weight":
+            args.s1_weight = float(args.value)
+    enable_acceptance = not args.no_acceptance
+    plot_file = None if args.no_plot else args.plot_file
+    exit_code = run_scenario(
+        n0_spike_time=args.n0_spike_time,
+        n1_spike_time=args.n1_spike_time,
+        s0_weight=args.s0_weight,
+        s1_weight=args.s1_weight,
+        delay=args.delay,
+        w_min=args.w_min,
+        w_max=args.w_max,
+        plot_file=plot_file,
+        enable_acceptance=enable_acceptance,
+    )
+    return exit_code
+
+
 if __name__ == "__main__":
-    run_demo()
+    sys.exit(main_cli())
